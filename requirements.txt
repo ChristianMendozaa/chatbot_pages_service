@@ -10,3 +10,4 @@ pydantic
 pymupdf
 python-multipart
 tiktoken
+langdetect

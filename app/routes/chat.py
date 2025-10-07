@@ -1,32 +1,27 @@
+# app/routes/chat.py
 import os
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from groq import Groq
 from ..deps.firebase import find_page_by_nickname
 from ..rag.service import retrieve
-
-# Usaremos tiktoken para contar tokens de manera precisa (instálalo con pip install tiktoken)
 import tiktoken
+from langdetect import detect, DetectorFactory
+
+DetectorFactory.seed = 0  # detección consistente
 
 router = APIRouter(tags=["chat"])
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# 🔢 Límite de tokens para la pregunta del usuario
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "300"))
 
 class ChatBody(BaseModel):
     nickname: str = Field(..., min_length=3)
     question: str = Field(..., min_length=2)
 
-SYSTEM_PROMPT = (
-    "Eres un asistente de una página. Responde con claridad y concisión usando SOLO el contexto. "
-    "Si el contexto no contiene la respuesta, di que no está disponible."
-)
-
 def count_tokens(text: str, model: str = "gpt-3.5-turbo") -> int:
-    """Cuenta tokens usando tiktoken (o una estimación si falla)."""
     try:
         enc = tiktoken.encoding_for_model(model)
         return len(enc.encode(text))
@@ -34,17 +29,20 @@ def count_tokens(text: str, model: str = "gpt-3.5-turbo") -> int:
         return len(text.split())
 
 def truncate_to_tokens(text: str, max_tokens: int, model: str = "gpt-3.5-turbo") -> str:
-    """Trunca el texto para no superar cierta cantidad de tokens."""
     try:
         enc = tiktoken.encoding_for_model(model)
-        tokens = enc.encode(text)
-        if len(tokens) <= max_tokens:
+        toks = enc.encode(text)
+        if len(toks) <= max_tokens:
             return text
-        truncated = enc.decode(tokens[:max_tokens])
-        return truncated
+        return enc.decode(toks[:max_tokens])
     except Exception:
-        # fallback simple si falla tiktoken
-        return text[:max_tokens * 4]  # aprox 4 chars/token
+        return text[:max_tokens * 4]
+
+def detect_language(text: str) -> str:
+    try:
+        return detect(text)
+    except Exception:
+        return "es"
 
 @router.post("/chat")
 def chat(body: ChatBody):
@@ -53,41 +51,58 @@ def chat(body: ChatBody):
     if not data or not data.get("chatbotActive", False):
         raise HTTPException(status_code=404, detail="Chatbot no activo para este nickname")
 
-    # 2️⃣ Limitar tokens de pregunta
+    # 2️⃣ Limitar tokens de input
     token_count = count_tokens(body.question, GROQ_MODEL)
     if token_count > MAX_INPUT_TOKENS:
         body.question = truncate_to_tokens(body.question, MAX_INPUT_TOKENS, GROQ_MODEL)
 
-    # 3️⃣ Recuperar contexto limitado
-    docs = retrieve(body.nickname, body.question, k=3)
-    context = "\n\n".join([f"[{i}] {t}" for (t, i) in docs]) or "(sin contexto)"
+    # 3️⃣ Detectar idioma del usuario
+    lang = detect_language(body.question)
+    lang_name = {
+        "es": "Spanish",
+        "en": "English",
+        "fr": "French",
+        "pt": "Portuguese",
+        "de": "German",
+        "it": "Italian"
+    }.get(lang, "Spanish")
 
-    # 4️⃣ Construir prompt
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"### CONTEXTO\n{context}\n\n"
-        f"### PREGUNTA\n{body.question}\n\n"
-        f"### INSTRUCCIONES\n"
-        f"Si no hay respuesta en el contexto, dilo claramente."
+    # 4️⃣ Obtener contexto (sin etiquetas ni índices)
+    docs = retrieve(body.nickname, body.question, k=3)
+    context = "\n".join([t for (t, _) in docs]) or "(no context found)"
+
+    # 5️⃣ Prompt optimizado
+    system_prompt = (
+        f"You are a helpful assistant that always responds in {lang_name}. "
+        "You must summarize information ONLY from the provided context. "
+        "Do not copy the sentences verbatim — instead, explain them naturally in the target language. "
+        "Do not include any Spanish text if the answer is in English, and do not mention the context explicitly. "
+        "If there is no relevant information in the context, reply exactly: 'Not available.'"
     )
 
-    # 5️⃣ Llamar al modelo Groq
+    user_prompt = (
+        f"Context:\n{context}\n\n"
+        f"Question: {body.question}\n\n"
+        f"Answer naturally in {lang_name}. Avoid parentheses, citations, or translation notes."
+    )
+
+    # 6️⃣ Llamar al modelo
     resp = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
-        temperature=0.7,
-        max_tokens=500,
+        temperature=0.4,
+        max_tokens=400,
     )
 
-    # 6️⃣ Extraer respuesta y métricas
-    answer = resp.choices[0].message.content
+    answer = resp.choices[0].message.content.strip()
     usage = getattr(resp, "usage", None)
 
     return {
         "answer": answer,
+        "language": lang_name,
         "sources": [{"index": i} for (_, i) in docs],
         "tokens": {
             "input_tokens": getattr(usage, "prompt_tokens", None),
