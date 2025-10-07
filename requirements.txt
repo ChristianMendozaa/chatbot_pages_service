@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+firebase-admin
+weaviate-client
+openai
+groq
+httpx
+pydantic
+pymupdf
+python-multipart
+tiktoken
