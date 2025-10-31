@@ -17,15 +17,14 @@ def get_wv_client():
     if not url:
         raise RuntimeError("WEAVIATE_URL no configurada")
 
-    # Conexión correcta según destino
     if _is_local_url(url):
-        # Local/self-hosted (sin Auth por API Key)
+        host_port = url.replace("http://", "").replace("https://", "")
+        host, port = (host_port.split(":") + ["8080"])[:2]
+        grpc_port = 50051
         client = weaviate.connect_to_local(
-            http_host=url.replace("http://", "").replace("https://", ""),  # p.ej. "localhost:8080"
-            grpc_host=url.replace("http://", "").replace("https://", "").split(":")[0] + ":50051",
+            host=host, port=int(port), grpc_port=grpc_port
         )
     else:
-        # Weaviate Cloud / cluster con API Key
         client = weaviate.connect_to_weaviate_cloud(
             cluster_url=url,
             auth_credentials=weaviate.auth.AuthApiKey(key) if key else None,
@@ -58,39 +57,36 @@ def ensure_collection():
                 Property(name="source", data_type=DataType.TEXT),
                 Property(name="chunk_index", data_type=DataType.INT),
             ],
-            vector_config=Configure.Vector(
-                distance_metric=VectorDistances.COSINE,
-                vectorizer=Configure.Vectorizer.none(),  # ya no se usa vectorizer_config separado
-                vector_index_type=Configure.VectorIndex.hnsw(),
+            # ❌ vector_config=Configure.Vector(...)  ->  ✅ usar estos dos:
+            vectorizer_config=Configure.Vectorizer.none(),
+            vector_index_config=Configure.VectorIndex.hnsw(
+                distance_metric=VectorDistances.COSINE
             ),
             multi_tenancy_config=Configure.multi_tenancy(enabled=True),
         )
-        client.collections.get(COLLECTION_NAME)
+        client.collections.get(COLLECTION_NAME)  # fuerza lazy init
     except WeaviateBaseError as e:
         raise RuntimeError(f"No se pudo crear la colección '{COLLECTION_NAME}': {e}")
 
 def ensure_tenant(nickname: str):
-    """
-    Upsert de tenant:
-    - Asegura que la colección existe.
-    - Intenta crear el tenant; si ya existe, continúa sin fallar.
-    """
     ensure_collection()
     client = get_wv_client()
     col = client.collections.get(COLLECTION_NAME)
 
     try:
-        # Crear directamente; si ya existe, Weaviate lanza error -> lo ignoramos
-        col.tenants.create(Tenant(name=nickname))
+        if hasattr(col.tenants, "create"):
+            col.tenants.create(Tenant(name=nickname))
+        elif hasattr(col.tenants, "add"):
+            col.tenants.add([Tenant(name=nickname)])
+        else:
+            # fallback raro
+            raise RuntimeError("El SDK de Weaviate no expone create/add para tenants.")
     except WeaviateBaseError as e:
         msg = str(e).lower()
         if "already exists" in msg or "conflict" in msg:
-            # Tenant ya creado: OK
             return
-        # Si el error es “class not found” aquí, es que la colección no quedó bien creada.
         if "class not found" in msg:
             raise RuntimeError("La colección DocChunk no existe (class not found). Revisa ensure_collection().")
-        # Otros errores sí los propagamos
         raise
 
 def delete_tenant(nickname: str):
